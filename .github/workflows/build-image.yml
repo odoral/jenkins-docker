@@ -43,32 +43,15 @@ jobs:
         id: upstream
         run: |
           set -euo pipefail
-          inspect_json="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}" --format '{{json .}}')"
-          digest="$(printf '%s' "${inspect_json}" | jq -r '
-            .Manifest.Digest
-            // .Manifest.digest
-            // .Descriptor.digest
-            // .descriptor.digest
-            // empty
-          ')"
-          if [ -z "${digest}" ]; then
-            digest="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}" | awk '/^Digest:/{print $2; exit}')"
-          fi
+          inspect_text="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}")"
+          digest="$(printf '%s\n' "${inspect_text}" | awk '/^Digest:/{print $2; exit}')"
           if [ -z "${digest}" ]; then
             echo "Could not resolve upstream digest" >&2
-            printf '%s\n' "${inspect_json}" | jq 'paths(scalars) as $p | {path:$p, value:getpath($p)}' | head -n 80 >&2 || true
+            printf '%s\n' "${inspect_text}" >&2
             exit 1
           fi
-          version="$(printf '%s' "${inspect_json}" | jq -r '
-            .Image.Config.Labels["org.opencontainers.image.version"]
-            // .Manifest.Annotations["org.opencontainers.image.version"]
-            // .Manifest.annotations["org.opencontainers.image.version"]
-            // empty
-          ')"
-          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
-            version="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}" --format '{{index .Image.Config.Labels "org.opencontainers.image.version"}}' || true)"
-          fi
-          if [ -z "${version}" ] || [ "${version}" = "null" ] || [ "${version}" = "<no value>" ]; then
+          version="$(printf '%s\n' "${inspect_text}" | awk -F': *' '/org\.opencontainers\.image\.version/{print $2; exit}')"
+          if [ -z "${version}" ]; then
             version="unknown"
           fi
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
@@ -85,13 +68,8 @@ jobs:
           set -euo pipefail
           should_build=true
           if [ "${EVENT_NAME}" = "schedule" ]; then
-            if published_json="$(docker buildx imagetools inspect "${PUBLISHED_IMAGE}" --format '{{json .}}' 2>/dev/null)"; then
-              current="$(printf '%s' "${published_json}" | jq -r '
-                .Manifest.Annotations["org.opencontainers.image.base.digest"]
-                // .Manifest.annotations["org.opencontainers.image.base.digest"]
-                // .Image.Config.Labels["org.opencontainers.image.base.digest"]
-                // empty
-              ')"
+            if published_text="$(docker buildx imagetools inspect "${PUBLISHED_IMAGE}" 2>/dev/null)"; then
+              current="$(printf '%s\n' "${published_text}" | awk -F': *' '/org\.opencontainers\.image\.base\.digest/{print $2; exit}')"
               echo "Published ${PUBLISHED_IMAGE} base digest=${current:-<none>}"
               if [ "${current}" = "${UPSTREAM_DIGEST}" ]; then
                 should_build=false
