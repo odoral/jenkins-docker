@@ -1,0 +1,216 @@
+name: Build and push image
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/build-image.yml
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_IMAGE: docker.io/jenkins/jenkins:lts
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  check:
+    name: Check upstream Jenkins LTS
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      base_digest: ${{ steps.upstream.outputs.digest }}
+      jenkins_version: ${{ steps.upstream.outputs.version }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream digest and version
+        id: upstream
+        run: |
+          set -euo pipefail
+          inspect_json="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}" --format '{{json .}}')"
+          digest="$(printf '%s' "${inspect_json}" | jq -r '.Manifest.Digest // .Descriptor.digest // empty')"
+          if [ -z "${digest}" ]; then
+            echo "Could not resolve upstream digest" >&2
+            exit 1
+          fi
+          version="$(printf '%s' "${inspect_json}" | jq -r '
+            .Image.Config.Labels["org.opencontainers.image.version"]
+            // .Manifest.Annotations["org.opencontainers.image.version"]
+            // empty
+          ')"
+          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+            version="unknown"
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Upstream ${UPSTREAM_IMAGE} digest=${digest} version=${version}"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISHED_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:lts
+          UPSTREAM_DIGEST: ${{ steps.upstream.outputs.digest }}
+        run: |
+          set -euo pipefail
+          should_build=true
+          if [ "${EVENT_NAME}" = "schedule" ]; then
+            if published_json="$(docker buildx imagetools inspect "${PUBLISHED_IMAGE}" --format '{{json .}}' 2>/dev/null)"; then
+              current="$(printf '%s' "${published_json}" | jq -r '
+                .Manifest.Annotations["org.opencontainers.image.base.digest"]
+                // .Image.Config.Labels["org.opencontainers.image.base.digest"]
+                // empty
+              ')"
+              echo "Published ${PUBLISHED_IMAGE} base digest=${current:-<none>}"
+              if [ "${current}" = "${UPSTREAM_DIGEST}" ]; then
+                should_build=false
+              fi
+            else
+              echo "No published image at ${PUBLISHED_IMAGE}; will build"
+            fi
+          else
+            echo "Event ${EVENT_NAME} always builds"
+          fi
+          echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Prepare
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "${GITHUB_ENV}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.base.name=${{ env.UPSTREAM_IMAGE }}
+            org.opencontainers.image.base.digest=${{ needs.check.outputs.base_digest }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_DIGEST=${{ needs.check.outputs.base_digest }}
+            BASE_NAME=${{ env.UPSTREAM_IMAGE }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and tag
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=lts
+            type=raw,value=lts-${{ needs.check.outputs.jenkins_version }},enable=${{ needs.check.outputs.jenkins_version != 'unknown' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.event_name != 'schedule' }}
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        env:
+          BASE_DIGEST: ${{ needs.check.outputs.base_digest }}
+        run: |
+          set -euo pipefail
+          tag_args="$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "${DOCKER_METADATA_OUTPUT_JSON}")"
+          refs=""
+          for digest_file in *; do
+            refs="${refs} ${REGISTRY}/${IMAGE_NAME}@sha256:${digest_file}"
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.base.name=${UPSTREAM_IMAGE}" \
+            --annotation "index:org.opencontainers.image.base.digest=${BASE_DIGEST}" \
+            --annotation "index:org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            ${tag_args} \
+            ${refs}
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:lts"
