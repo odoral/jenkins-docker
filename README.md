@@ -11,7 +11,7 @@ Use this image when you want Jenkins to talk to a **host Docker daemon** through
 Published image:
 
 ```text
-ghcr.io/oscar/jenkins-docker
+ghcr.io/odoral/jenkins-docker
 ```
 
 Tags:
@@ -25,14 +25,14 @@ Tags:
 `docker pull` selects `linux/amd64` or `linux/arm64` to match the host.
 
 ```bash
-docker pull ghcr.io/oscar/jenkins-docker:lts
+docker pull ghcr.io/odoral/jenkins-docker:lts
 ```
 
 If the package is public, no login is required. For a private package:
 
 ```bash
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
-docker pull ghcr.io/oscar/jenkins-docker:lts
+docker pull ghcr.io/odoral/jenkins-docker:lts
 ```
 
 ## Run Jenkins
@@ -46,7 +46,7 @@ docker run -d --name jenkins \
   -p 50000:50000 \
   -v jenkins_home:/var/jenkins_home \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  ghcr.io/oscar/jenkins-docker:lts
+  ghcr.io/odoral/jenkins-docker:lts
 ```
 
 Open `http://localhost:8080` and complete the usual Jenkins setup wizard.
@@ -69,7 +69,7 @@ docker run -d --name jenkins \
   -p 50000:50000 \
   -v jenkins_home:/var/jenkins_home \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  ghcr.io/oscar/jenkins-docker:lts
+  ghcr.io/odoral/jenkins-docker:lts
 ```
 
 or rebuild locally with `--build-arg DOCKER_GID=<gid>`.
@@ -79,7 +79,7 @@ or rebuild locally with `--build-arg DOCKER_GID=<gid>`.
 ```yaml
 services:
   jenkins:
-    image: ghcr.io/oscar/jenkins-docker:lts
+    image: ghcr.io/odoral/jenkins-docker:lts
     restart: on-failure
     ports:
       - "8080:8080"
