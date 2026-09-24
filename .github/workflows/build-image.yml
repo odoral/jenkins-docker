@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      check_only:
+        description: Run the digest check and skip the build if upstream is unchanged
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -43,17 +48,13 @@ jobs:
         id: upstream
         run: |
           set -euo pipefail
-          inspect_text="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}")"
-          digest="$(printf '%s\n' "${inspect_text}" | awk '/^Digest:/{print $2; exit}')"
+          digest="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}" --format '{{.Manifest.Digest}}')"
           if [ -z "${digest}" ]; then
             echo "Could not resolve upstream digest" >&2
-            printf '%s\n' "${inspect_text}" >&2
             exit 1
           fi
-          version="$(printf '%s\n' "${inspect_text}" | awk -F': *' '/org\.opencontainers\.image\.version/{print $2; exit}')"
-          if [ -z "${version}" ]; then
-            version="unknown"
-          fi
+          version="$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}" --format '{{json .Image}}' \
+            | jq -r '[to_entries[].value.config.Labels["org.opencontainers.image.version"] // empty] | first // "unknown"')"
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "Upstream ${UPSTREAM_IMAGE} digest=${digest} version=${version}"
@@ -62,25 +63,30 @@ jobs:
         id: decide
         env:
           EVENT_NAME: ${{ github.event_name }}
+          CHECK_ONLY: ${{ inputs.check_only }}
           PUBLISHED_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:lts
           UPSTREAM_DIGEST: ${{ steps.upstream.outputs.digest }}
         run: |
           set -euo pipefail
           should_build=true
-          if [ "${EVENT_NAME}" = "schedule" ]; then
-            if published_text="$(docker buildx imagetools inspect "${PUBLISHED_IMAGE}" 2>/dev/null)"; then
-              current="$(printf '%s\n' "${published_text}" | awk -F': *' '/org\.opencontainers\.image\.base\.digest/{print $2; exit}')"
+          reason="event ${EVENT_NAME} always builds"
+          if [ "${EVENT_NAME}" = "schedule" ] || [ "${CHECK_ONLY}" = "true" ]; then
+            if raw="$(docker buildx imagetools inspect "${PUBLISHED_IMAGE}" --raw 2>/dev/null)"; then
+              current="$(printf '%s' "${raw}" | jq -r '.annotations["org.opencontainers.image.base.digest"] // empty')"
               echo "Published ${PUBLISHED_IMAGE} base digest=${current:-<none>}"
-              if [ "${current}" = "${UPSTREAM_DIGEST}" ]; then
+              if [ -n "${current}" ] && [ "${current}" = "${UPSTREAM_DIGEST}" ]; then
                 should_build=false
+                reason="upstream ${UPSTREAM_IMAGE} unchanged"
+              else
+                reason="upstream digest differs or annotation missing"
               fi
             else
-              echo "No published image at ${PUBLISHED_IMAGE}; will build"
+              reason="no published image at ${PUBLISHED_IMAGE}"
             fi
-          else
-            echo "Event ${EVENT_NAME} always builds"
           fi
           echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
+          echo "should_build=${should_build} (${reason})" >> "${GITHUB_STEP_SUMMARY}"
+          echo "should_build=${should_build} (${reason})"
 
   build:
     name: Build ${{ matrix.platform }}
